@@ -46,7 +46,10 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -66,6 +69,12 @@ public class CaptureService extends Service {
     private static final int NOTIFICATION_ID = 42;
     private static final String CHANNEL_ID = "ai_screen_check";
     private static final int AUDIO_SECONDS = 8;
+    // Image detection tuning: keep more detail than the old 900px/JPEG84 pipeline.
+    private static final int MAX_CAPTURE_WIDTH = 1440;
+    private static final int IMAGE_JPEG_QUALITY = 95;
+    private static final double FAST_AI_CONFIDENCE = 0.88;
+    private static final double FAST_REAL_CONFIDENCE = 0.12;
+    private static final double EXTRA_CROP_DISAGREEMENT = 0.28;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService networkExecutor = Executors.newFixedThreadPool(3);
@@ -170,7 +179,7 @@ public class CaptureService extends Service {
         DisplayMetrics dm = getResources().getDisplayMetrics();
         int sourceW = Math.max(1, dm.widthPixels);
         int sourceH = Math.max(1, dm.heightPixels);
-        int captureW = Math.min(900, sourceW);
+        int captureW = Math.min(MAX_CAPTURE_WIDTH, sourceW);
         int captureH = Math.max(1, Math.round(sourceH * (captureW / (float) sourceW)));
         int density = dm.densityDpi;
 
@@ -240,26 +249,29 @@ public class CaptureService extends Service {
     }
 
     private void handleImageFrame(ScanSession session, Bitmap bitmap) {
-        byte[] jpeg = jpeg(bitmap);
-        bitmap.recycle();
         networkExecutor.execute(() -> {
             try {
-                AiApiClient.ScoreResult r = aiClient.analyzeImage(jpeg);
+                VisualConsensus r = analyzeVisualAdaptive(bitmap);
                 updateLine(session, "Image", visualScore(r));
             } catch (Exception e) {
                 updateLine(session, "Image", "error: " + shortMessage(e));
+            } finally {
+                if (!bitmap.isRecycled()) bitmap.recycle();
             }
         });
     }
 
     private void handleSmartFrame(ScanSession session, Bitmap bitmap) {
-        byte[] jpeg = jpeg(bitmap);
+        // OCR and visual analysis run concurrently. Give the visual detector its own bitmap.
+        Bitmap visualBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false);
         networkExecutor.execute(() -> {
             try {
-                AiApiClient.ScoreResult r = aiClient.analyzeImage(jpeg);
+                VisualConsensus r = analyzeVisualAdaptive(visualBitmap);
                 updateLine(session, "Visual", visualScore(r));
             } catch (Exception e) {
                 updateLine(session, "Visual", "error: " + shortMessage(e));
+            } finally {
+                if (!visualBitmap.isRecycled()) visualBitmap.recycle();
             }
         });
 
@@ -522,9 +534,100 @@ public class CaptureService extends Service {
     }
 
     private byte[] jpeg(Bitmap bitmap) {
+        return jpeg(bitmap, IMAGE_JPEG_QUALITY);
+    }
+
+    private byte[] jpeg(Bitmap bitmap, int quality) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 84, out);
+        bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out);
         return out.toByteArray();
+    }
+
+    /**
+     * Runs an adaptive ensemble instead of trusting one full-screen screenshot.
+     * Most clear cases cost one API request. Ambiguous cases compare a central crop,
+     * and strongly disagreeing cases use a third tighter crop. The final score is
+     * the median, which is deliberately resistant to one bad crop/UI-heavy sample.
+     */
+    private VisualConsensus analyzeVisualAdaptive(Bitmap source) throws Exception {
+        List<Double> scores = new ArrayList<>();
+        List<String> generators = new ArrayList<>();
+
+        AiApiClient.ScoreResult full = aiClient.analyzeImage(jpeg(source));
+        scores.add(full.aiScore);
+        generators.add(full.generator);
+
+        // Extremely clear results do not spend extra requests.
+        if (full.aiScore >= FAST_AI_CONFIDENCE || full.aiScore <= FAST_REAL_CONFIDENCE) {
+            return new VisualConsensus(full.aiScore, full.generator, 1, 0.0);
+        }
+
+        Bitmap crop82 = centerCrop(source, 0.82f);
+        try {
+            AiApiClient.ScoreResult middle = aiClient.analyzeImage(jpeg(crop82));
+            scores.add(middle.aiScore);
+            generators.add(middle.generator);
+        } finally {
+            crop82.recycle();
+        }
+
+        double spread = scoreSpread(scores);
+        double twoMedian = median(scores);
+        // A third opinion is useful only when the first two disagree or hover near 50/50.
+        if (spread >= EXTRA_CROP_DISAGREEMENT || (twoMedian >= 0.35 && twoMedian <= 0.65)) {
+            Bitmap crop64 = centerCrop(source, 0.64f);
+            try {
+                AiApiClient.ScoreResult tight = aiClient.analyzeImage(jpeg(crop64));
+                scores.add(tight.aiScore);
+                generators.add(tight.generator);
+            } finally {
+                crop64.recycle();
+            }
+        }
+
+        double finalScore = median(scores);
+        spread = scoreSpread(scores);
+        String generator = consensusGenerator(generators, finalScore);
+        return new VisualConsensus(finalScore, generator, scores.size(), spread);
+    }
+
+    private static Bitmap centerCrop(Bitmap source, float fraction) {
+        fraction = Math.max(0.50f, Math.min(1.0f, fraction));
+        int w = Math.max(1, Math.round(source.getWidth() * fraction));
+        int h = Math.max(1, Math.round(source.getHeight() * fraction));
+        int x = Math.max(0, (source.getWidth() - w) / 2);
+        int y = Math.max(0, (source.getHeight() - h) / 2);
+        return Bitmap.createBitmap(source, x, y, w, h);
+    }
+
+    private static double median(List<Double> values) {
+        List<Double> copy = new ArrayList<>(values);
+        Collections.sort(copy);
+        int n = copy.size();
+        if ((n & 1) == 1) return copy.get(n / 2);
+        return (copy.get(n / 2 - 1) + copy.get(n / 2)) / 2.0;
+    }
+
+    private static double scoreSpread(List<Double> values) {
+        if (values.size() < 2) return 0.0;
+        double min = 1.0, max = 0.0;
+        for (double v : values) { min = Math.min(min, v); max = Math.max(max, v); }
+        return max - min;
+    }
+
+    private static String consensusGenerator(List<String> generators, double score) {
+        if (score < 0.55) return "";
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (String g : generators) {
+            if (g == null || g.trim().isEmpty()) continue;
+            counts.put(g, counts.getOrDefault(g, 0) + 1);
+        }
+        String best = "";
+        int bestCount = 0;
+        for (Map.Entry<String, Integer> e : counts.entrySet()) {
+            if (e.getValue() > bestCount) { best = e.getKey(); bestCount = e.getValue(); }
+        }
+        return best;
     }
 
     private void showBubble() {
@@ -710,9 +813,20 @@ public class CaptureService extends Service {
         renderSession(session);
     }
 
-    private String visualScore(AiApiClient.ScoreResult r) {
-        String s = classification(r.aiScore, "AI visual", "real visual");
-        if (!r.generator.isEmpty() && r.aiScore >= 0.5) s += " • " + r.generator;
+    private String visualScore(VisualConsensus r) {
+        String s;
+        // If crops disagree heavily, never present a confident binary verdict.
+        if (r.spread >= 0.40) {
+            s = String.format(Locale.US, "uncertain • AI %.0f%% • crops disagree", r.aiScore * 100.0);
+        } else if (r.aiScore >= 0.75) {
+            s = String.format(Locale.US, "AI visual %.0f%%", r.aiScore * 100.0);
+        } else if (r.aiScore <= 0.25) {
+            s = String.format(Locale.US, "real visual %.0f%%", (1.0 - r.aiScore) * 100.0);
+        } else {
+            s = String.format(Locale.US, "uncertain • AI %.0f%%", r.aiScore * 100.0);
+        }
+        if (!r.generator.isEmpty() && r.aiScore >= 0.60) s += " • " + r.generator;
+        if (r.calls > 1) s += " • " + r.calls + " samples";
         return s;
     }
 
@@ -906,6 +1020,21 @@ public class CaptureService extends Service {
         out.write((v >> 8) & 0xff);
         out.write((v >> 16) & 0xff);
         out.write((v >> 24) & 0xff);
+    }
+
+
+    private static final class VisualConsensus {
+        final double aiScore;
+        final String generator;
+        final int calls;
+        final double spread;
+
+        VisualConsensus(double aiScore, String generator, int calls, double spread) {
+            this.aiScore = aiScore;
+            this.generator = generator == null ? "" : generator;
+            this.calls = calls;
+            this.spread = spread;
+        }
     }
 
     private enum FrameKind { IMAGE, TEXT, SMART, VIDEO }
